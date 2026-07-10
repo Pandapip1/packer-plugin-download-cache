@@ -5,11 +5,16 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/hashicorp/hcl/v2/hcldec"
 	"github.com/zclconf/go-cty/cty"
@@ -19,18 +24,21 @@ import (
 type Entry struct {
 	URLs    []string // len==1 for single-URL entries; len>1 for multipart archives
 	Extract bool
+	Dir     bool
 	Creds   Credentials
 }
 
 type Datasource struct {
 	globalCreds Credentials
 	entries     map[string]Entry
+	progress    bool
 }
 
 var entrySpec = hcldec.ObjectSpec{
 	"url":     &hcldec.AttrSpec{Name: "url", Type: cty.String, Required: false},
 	"urls":    &hcldec.AttrSpec{Name: "urls", Type: cty.List(cty.String), Required: false},
 	"extract": &hcldec.AttrSpec{Name: "extract", Type: cty.Bool, Required: false},
+	"dir":     &hcldec.AttrSpec{Name: "dir", Type: cty.Bool, Required: false},
 	"credentials": &hcldec.BlockMapSpec{
 		TypeName:   "credentials",
 		LabelNames: []string{"scheme"},
@@ -40,6 +48,7 @@ var entrySpec = hcldec.ObjectSpec{
 
 func (d *Datasource) ConfigSpec() hcldec.ObjectSpec {
 	return hcldec.ObjectSpec{
+		"progress":    &hcldec.AttrSpec{Name: "progress", Type: cty.Bool, Required: false},
 		"credentials": credentialsBlockMapSpec,
 		"entry": &hcldec.BlockMapSpec{
 			TypeName:   "entry",
@@ -66,6 +75,9 @@ func (d *Datasource) Configure(configs ...interface{}) error {
 			continue
 		}
 
+		if pv := cval.GetAttr("progress"); pv.IsKnown() && !pv.IsNull() {
+			d.progress = pv.True()
+		}
 		if cv := cval.GetAttr("credentials"); cv.IsKnown() && !cv.IsNull() {
 			d.globalCreds = parseCredentials(cv)
 		}
@@ -101,6 +113,9 @@ func (d *Datasource) Configure(configs ...interface{}) error {
 			if ex := ev.GetAttr("extract"); ex.IsKnown() && !ex.IsNull() {
 				entry.Extract = ex.True()
 			}
+			if dv := ev.GetAttr("dir"); dv.IsKnown() && !dv.IsNull() {
+				entry.Dir = dv.True()
+			}
 			if cv := ev.GetAttr("credentials"); cv.IsKnown() && !cv.IsNull() {
 				entry.Creds = parseCredentials(cv)
 			}
@@ -111,6 +126,9 @@ func (d *Datasource) Configure(configs ...interface{}) error {
 }
 
 func (d *Datasource) Execute() (cty.Value, error) {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	cacheDir, err := pluginCacheDir()
 	if err != nil {
 		return cty.NilVal, err
@@ -138,7 +156,7 @@ func (d *Datasource) Execute() (cty.Value, error) {
 		go func(name string, entry Entry) {
 			defer wg.Done()
 			creds := d.globalCreds.Merge(entry.Creds)
-			path, err := process(entry, creds, filesDir, db)
+			path, err := process(ctx, entry, creds, filesDir, db, d.progress)
 			ch <- result{name: name, path: path, err: err}
 		}(name, entry)
 	}
@@ -161,7 +179,7 @@ func (d *Datasource) Execute() (cty.Value, error) {
 	return cty.ObjectVal(map[string]cty.Value{"paths": pathsVal}), nil
 }
 
-func process(entry Entry, creds Credentials, filesDir string, db *sql.DB) (string, error) {
+func process(ctx context.Context, entry Entry, creds Credentials, filesDir string, db *sql.DB, showProgress bool) (string, error) {
 	primaryURL := entry.URLs[0]
 
 	var cached string
@@ -170,6 +188,28 @@ func process(entry Entry, creds Credentials, filesDir string, db *sql.DB) (strin
 			return cached, nil
 		}
 		db.Exec("DELETE FROM entries WHERE url = ?", primaryURL) //nolint:errcheck
+	}
+
+	if entry.Dir {
+		fetcher, err := fetcherFor(primaryURL)
+		if err != nil {
+			return "", err
+		}
+		df, ok := fetcher.(DirFetcher)
+		if !ok {
+			return "", fmt.Errorf("fetcher for %q does not support dir downloads", primaryURL)
+		}
+		dest := filepath.Join(filesDir, filenameOf(primaryURL))
+		if err := os.MkdirAll(dest, 0o755); err != nil {
+			return "", err
+		}
+		if err := df.FetchDir(ctx, primaryURL, creds, dest, showProgress); err != nil {
+			return "", err
+		}
+		if _, err := db.Exec("INSERT OR REPLACE INTO entries (url, path) VALUES (?, ?)", primaryURL, dest); err != nil {
+			return "", fmt.Errorf("updating cache db: %w", err)
+		}
+		return dest, nil
 	}
 
 	type dlResult struct {
@@ -188,7 +228,7 @@ func process(entry Entry, creds Credentials, filesDir string, db *sql.DB) (strin
 				return
 			}
 			archivePath := filepath.Join(filesDir, filenameOf(rawURL))
-			mime, err := downloadTo(context.Background(), fetcher, rawURL, creds, archivePath)
+			mime, err := downloadTo(ctx, fetcher, rawURL, creds, archivePath, showProgress)
 			results[i] = dlResult{mime: mime, err: err}
 		}(i, rawURL)
 	}
@@ -229,31 +269,100 @@ func process(entry Entry, creds Credentials, filesDir string, db *sql.DB) (strin
 }
 
 // downloadTo fetches rawURL to dest (skipping if already present) and returns the fetcher-reported MIME type.
-func downloadTo(ctx context.Context, fetcher Fetcher, rawURL string, creds Credentials, dest string) (string, error) {
+// If a .part file exists from a previous interrupted download, it resumes from that offset.
+func downloadTo(ctx context.Context, fetcher Fetcher, rawURL string, creds Credentials, dest string, showProgress bool) (string, error) {
 	if _, err := os.Stat(dest); err == nil {
 		return "", nil // already on disk; MIME will be sniffed from the file
 	}
-	body, mimeType, err := fetcher.Fetch(ctx, rawURL, creds)
-	if err != nil {
-		return "", err
-	}
-	defer body.Close()
 
 	tmp := dest + ".part"
-	f, err := os.Create(tmp)
+	var requestOffset int64
+	if fi, err := os.Stat(tmp); err == nil {
+		requestOffset = fi.Size()
+	}
+
+	result, err := fetcher.Fetch(ctx, rawURL, creds, requestOffset)
 	if err != nil {
 		return "", err
 	}
-	if _, err = io.Copy(f, body); err != nil {
+	defer result.Body.Close()
+
+	// Open the part file: append if the server honoured our range request, otherwise start fresh.
+	var f *os.File
+	if result.BodyOffset > 0 {
+		f, err = os.OpenFile(tmp, os.O_WRONLY|os.O_APPEND, 0o644)
+	} else {
+		f, err = os.Create(tmp)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	name := filepath.Base(dest)
+	var bytesRead atomic.Int64
+	bytesRead.Store(result.BodyOffset)
+
+	if showProgress {
+		if result.BodyOffset > 0 {
+			log.Printf("[download] resuming %s from %.1f MB", name, float64(result.BodyOffset)/1e6)
+		} else {
+			log.Printf("[download] starting %s", name)
+		}
+		stop := make(chan struct{})
+		defer close(stop)
+		sessionStart := time.Now()
+		sessionBase := result.BodyOffset
+		go func() {
+			tick := time.NewTicker(5 * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-tick.C:
+					total := bytesRead.Load()
+					sessionBytes := total - sessionBase
+					elapsed := time.Since(sessionStart).Seconds()
+					mbps := float64(sessionBytes) / elapsed / 1e6
+					if result.TotalSize > 0 {
+						log.Printf("[download] %s: %.1f%% (%.1f MB/s)", name, float64(total)/float64(result.TotalSize)*100, mbps)
+					} else {
+						log.Printf("[download] %s: %.1f MB (%.1f MB/s)", name, float64(total)/1e6, mbps)
+					}
+				}
+			}
+		}()
+	}
+
+	counted := &countingReader{r: result.Body, n: &bytesRead}
+	if _, err = io.Copy(f, counted); err != nil {
 		f.Close()
-		os.Remove(tmp)
+		if ctx.Err() == nil {
+			os.Remove(tmp)
+		}
 		return "", err
 	}
 	if err = f.Close(); err != nil {
-		os.Remove(tmp)
+		if ctx.Err() == nil {
+			os.Remove(tmp)
+		}
 		return "", err
 	}
-	return mimeType, os.Rename(tmp, dest)
+	if showProgress {
+		log.Printf("[download] %s: done (%.1f MB)", name, float64(bytesRead.Load())/1e6)
+	}
+	return result.MIMEType, os.Rename(tmp, dest)
+}
+
+type countingReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n.Add(int64(n))
+	return n, err
 }
 
 func pluginCacheDir() (string, error) {

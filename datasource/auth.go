@@ -21,9 +21,16 @@ type HTTPCreds struct {
 	Headers     map[string]string
 }
 
+type SMBCreds struct {
+	Username string
+	Password string
+	Domain   string
+}
+
 type Credentials struct {
 	AWS  *AWSCreds
 	HTTP *HTTPCreds
+	SMB  *SMBCreds
 }
 
 // credentialsSpec is the shared hcldec spec for a credentials "…" { } block.
@@ -42,6 +49,8 @@ var credentialsSpec = hcldec.ObjectSpec{
 	"username":     &hcldec.AttrSpec{Name: "username", Type: cty.String, Required: false},
 	"password":     &hcldec.AttrSpec{Name: "password", Type: cty.String, Required: false},
 	"headers":      &hcldec.AttrSpec{Name: "headers", Type: cty.Map(cty.String), Required: false},
+	// SMB fields
+	"domain": &hcldec.AttrSpec{Name: "domain", Type: cty.String, Required: false},
 }
 
 // credentialsBlockMapSpec is the BlockMapSpec used wherever credentials blocks appear.
@@ -75,13 +84,18 @@ func parseCredentials(val cty.Value) Credentials {
 				Password:    strAttr(cv, "password"),
 				Headers:     mapAttr(cv, "headers"),
 			}
+		case "smb":
+			creds.SMB = &SMBCreds{
+				Username: strAttr(cv, "username"),
+				Password: strAttr(cv, "password"),
+				Domain:   strAttr(cv, "domain"),
+			}
 		}
 	}
 	return creds
 }
 
 // Merge returns a copy of base with non-zero fields from override applied.
-// A non-nil override.AWS completely replaces base.AWS; same for HTTP.
 func (base Credentials) Merge(override Credentials) Credentials {
 	out := base
 	if override.AWS != nil {
@@ -89,6 +103,9 @@ func (base Credentials) Merge(override Credentials) Credentials {
 	}
 	if override.HTTP != nil {
 		out.HTTP = override.HTTP
+	}
+	if override.SMB != nil {
+		out.SMB = override.SMB
 	}
 	return out
 }

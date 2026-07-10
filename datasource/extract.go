@@ -45,7 +45,10 @@ func extractorFor(mimeType string) Extractor {
 // sniffMIME resolves the MIME type for an already-downloaded archive.
 // Priority: fetcherMIME (if useful) → magic bytes → extension.
 func sniffMIME(archivePath, fetcherMIME string) string {
-	if fetcherMIME != "" && fetcherMIME != "application/octet-stream" {
+	switch fetcherMIME {
+	case "", "application/octet-stream", "binary/octet-stream", "application/binary":
+		// generic — fall through to magic-byte and extension sniffing
+	default:
 		return fetcherMIME
 	}
 	if m := sniffBytes(archivePath); m != "" {
